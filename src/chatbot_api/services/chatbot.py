@@ -2,12 +2,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from typing import Optional, List, Any
 import asyncio
-import redis.asyncio as redis
 import json
 import uuid
+from sqlalchemy.orm import selectinload
+from sqlalchemy import select, desc
 
 from ..core.config import settings
 from ..prompts.legal_prompts import SYSTEM_PROMPT, get_prompt_by_type
+from ..database.database import AsyncSessionLocal
+from ..models.database import ConversationHistory
 
 
 class JuremaLLM:
@@ -64,38 +67,54 @@ class JuremaLLM:
 class ChatbotService:
     def __init__(self):
         self.llm = JuremaLLM()
-        self.redis_client = None
-
-    async def _get_redis_client(self):
-        if not self.redis_client:
-            self.redis_client = redis.from_url(settings.redis_url)
-        return self.redis_client
 
     async def _get_conversation_history(self, session_id: str) -> List[dict]:
-        redis_client = await self._get_redis_client()
-        history_key = f"conversation:{session_id}"
-
+        """Get conversation history from PostgreSQL"""
         try:
-            history_data = await redis_client.get(history_key)
-            if history_data:
-                return json.loads(history_data)
+            async with AsyncSessionLocal() as db_session:
+                # Get last 10 conversations for this session
+                query = select(ConversationHistory).where(
+                    ConversationHistory.session_id == session_id
+                ).order_by(desc(ConversationHistory.timestamp)).limit(10)
+
+                result = await db_session.execute(query)
+                conversations = result.scalars().all()
+
+                # Convert to list format (reverse to get chronological order)
+                history = []
+                for conv in reversed(conversations):
+                    if conv.user_message:
+                        history.append({
+                            "role": "user",
+                            "content": conv.user_message
+                        })
+                    if conv.bot_response:
+                        history.append({
+                            "role": "assistant",
+                            "content": conv.bot_response
+                        })
+
+                return history[-20:]  # Keep last 20 messages to limit context
+
         except Exception as e:
             print(f"Error retrieving conversation history: {e}")
+            return []
 
-        return []
-
-    async def _save_conversation_history(self, session_id: str, history: List[dict]):
-        redis_client = await self._get_redis_client()
-        history_key = f"conversation:{session_id}"
-
+    async def _save_conversation_to_db(self, session_id: str, user_message: str, bot_response: str):
+        """Save conversation to PostgreSQL"""
         try:
-            await redis_client.setex(
-                history_key,
-                3600,  # 1 hour TTL
-                json.dumps(history)
-            )
+            async with AsyncSessionLocal() as db_session:
+                conversation = ConversationHistory(
+                    session_id=session_id,
+                    user_message=user_message,
+                    bot_response=bot_response,
+                    is_document=False
+                )
+                db_session.add(conversation)
+                await db_session.commit()
+
         except Exception as e:
-            print(f"Error saving conversation history: {e}")
+            print(f"❌ Error saving conversation to database: {e}")
 
     async def generate_response(self, message: str, session_id: Optional[str] = None, consultation_type: str = "consultation") -> str:
         if not session_id:
@@ -109,8 +128,11 @@ class ChatbotService:
 
         # Build conversation context from history
         conversation_context = ""
-        for entry in history[-3:]:  # Keep last 3 exchanges for context
-            conversation_context += f"Usuário: {entry['user']}\nAssistente: {entry['bot']}\n\n"
+        for entry in history[-6:]:  # Keep last 6 messages (3 exchanges) for context
+            if entry['role'] == 'user':
+                conversation_context += f"Usuário: {entry['content']}\n"
+            elif entry['role'] == 'assistant':
+                conversation_context += f"Assistente: {entry['content']}\n\n"
 
         # Get the appropriate prompt based on consultation type
         if consultation_type != "consultation":
@@ -140,12 +162,7 @@ class ChatbotService:
             full_prompt
         )
 
-        # Update conversation history
-        history.append({
-            "user": message,
-            "bot": response
-        })
-
-        await self._save_conversation_history(session_id, history)
+        # Save conversation to database
+        await self._save_conversation_to_db(session_id, message, response)
 
         return response
